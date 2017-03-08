@@ -10,6 +10,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -17,7 +18,38 @@ const (
 	procDir  = "/proc"
 )
 
+// MemChunk contains information regarding a chunk of memory and its path if present
+type MemChunk struct {
+	// An empty string in the path indicates that this is an anonymous block
+	Path      string
+	Data      []ChunkData
+	TotalSize int64
+}
+
+// ChunkData contains individual memory chunks
+type ChunkData struct {
+	Data []byte
+	Size int64
+}
+
+// MemSample contains time series data for memory samples
+type MemSample struct {
+	SampleTime time.Time
+	Samples    map[string]int64
+}
+
+// MemMapData represents the data provided from a memory mapping
+type MemMapData struct {
+	Start    int64
+	End      int64
+	Readable bool
+	Path     string
+}
+
 var procName = flag.String("procName", "", "Process name to monitor")
+var peekMode = flag.Bool("peek", false, "Enable peek mode to view memory contents")
+var outFile = flag.String("out", "./out.rep", "The output file to be used for reporting time series data")
+var writeOut = flag.Bool("writeout", false, "Cause the time series data to be written to a file specified by the '--out' flag")
 
 func getPIDList() (pids []int) {
 	files, err := ioutil.ReadDir(procDir)
@@ -73,47 +105,117 @@ func getProcessPid(pids []int) int {
 	return -1
 }
 
-func procMap(ppath string) {
-	// Get the contents of the "maps" file from the process
+func addrToInt(addr string) (v int64) {
+	v, err := strconv.ParseInt(addr, 16, 64)
+	if err != nil {
+		errFields := strings.FieldsFunc(err.Error(), func(r rune) bool {
+			if r == ':' {
+				return true
+			}
+			return false
+		})
+		if len(errFields) == 3 && strings.TrimSpace(errFields[2]) == "value out of range" {
+			return -1
+		}
+		log.Fatal(err.Error())
+	}
+	return
+}
+
+func parseMaps(ppath string) []string {
 	b, err := ioutil.ReadFile(path.Join(ppath, "maps"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Split out into lines for each mem region
-	asStr := lines(b)
+	res := lines(b)
+	return res
+}
+
+func getMapData(line string) (out MemMapData) {
+	f := strings.Fields(line)
+	out.Readable = len(f) >= 2 && f[1][0] == 'r'
+	if len(f) >= 6 {
+		out.Path = f[5]
+	} else {
+		out.Path = "anonymous"
+	}
+	addrSplit := strings.Split(f[0], "-")
+	if len(addrSplit) != 2 {
+		log.Fatal("Unable to parse address space")
+	}
+	out.Start = addrToInt(addrSplit[0])
+	out.End = addrToInt(addrSplit[1])
+	return
+}
+
+func procMap(ppath string) {
+	asStr := parseMaps(ppath)
+	results := make(map[string]MemChunk)
 	// Go over each region
 	for _, v := range asStr {
-		// Split the record into fields and read the permissions field
-		f := strings.Fields(v)
-		perms := f[1]
-		// If this region of memory is readable ...
-		if perms[0] == 'r' {
+		mapData := getMapData(v)
+		if mapData.Readable {
+			var chunk MemChunk
+			if c, ok := results[mapData.Path]; ok {
+				chunk = c
+			} else {
+				chunk = MemChunk{}
+				chunk.Path = mapData.Path
+				chunk.Data = make([]ChunkData, 0, 0)
+				chunk.TotalSize = 0
+			}
+			// Prepare new ChunkData
+			dat := ChunkData{}
+
 			// Open the memory file
-			_, err := os.Open(path.Join(ppath, "mem"))
+			m, err := os.Open(path.Join(ppath, "mem"))
 			if err != nil {
 				log.Fatal(err)
 			}
+			defer m.Close()
 			// Get the start and end of the region
-			rSplit := strings.Split(f[0], "-")
-			if len(rSplit) != 2 {
-				log.Fatal("Unable to parse address space")
-			}
-			start, err := strconv.ParseInt(rSplit[0], 16, 64)
+			chunkSize := mapData.End - mapData.Start
+			dat.Size = chunkSize
+			b := make([]byte, chunkSize, chunkSize)
+			_, err = m.ReadAt(b, mapData.Start)
 			if err != nil {
 				log.Fatal(err)
 			}
-			end, err := strconv.ParseInt(rSplit[1], 16, 64)
-			if err != nil {
-				log.Fatal(err)
-			}
-			fmt.Println(start, end)
+			dat.Data = b
+			chunk.Data = append(chunk.Data, dat)
+			chunk.TotalSize += chunkSize
+			results[mapData.Path] = chunk
 		}
 	}
+	overall := int64(0)
+	for k, v := range results {
+		fmt.Println(k, v.TotalSize)
+		overall += v.TotalSize
+	}
+	fmt.Println("Total size", overall)
+}
+
+func takeSample(ppath string, writeFile *os.File) {
+	mapLines := parseMaps(ppath)
+	sample := MemSample{
+		SampleTime: time.Now(),
+		Samples:    make(map[string]int64),
+	}
+	for _, v := range mapLines {
+		mapData := getMapData(v)
+		if mapData.Readable {
+			sample.Samples[mapData.Path] += (mapData.End - mapData.Start)
+		}
+	}
+	t := int64(0)
+	for _, v := range sample.Samples {
+		t += v
+	}
+	sample.Samples["Total"] = t
+	fmt.Println(sample)
 }
 
 func main() {
-	flag.Parse()
-
 	// Check to make sure we're running as root or sudo
 	out, err := exec.Command("whoami").Output()
 	if err != nil {
@@ -122,11 +224,35 @@ func main() {
 	if rootUser != strings.TrimSpace(string(out)) {
 		log.Fatal("Unable to operate without root")
 	}
+
+	flag.Parse()
+
+	// Sort out operational parameters
+	if *procName == "" {
+		log.Fatal("Process name is required")
+	}
+
+	var oFile *os.File
+
+	if *writeOut {
+		oFile, err = os.Open(*outFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		oFile = nil
+	}
+
 	p := getPIDList()
 	pp := getProcessPid(p)
 	if pp < 0 {
-		log.Fatal("Unabled to find pid for procName: " + *procName)
+		log.Fatal("Unable to find pid for procName: " + *procName)
 	}
 	procPath := path.Join(procDir, strconv.Itoa(pp))
-	procMap(procPath)
+
+	if *peekMode {
+		procMap(procPath)
+	}
+
+	takeSample(procPath, oFile)
 }
