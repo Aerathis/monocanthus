@@ -1,7 +1,7 @@
-package main
+package monocanthus
 
 import (
-	"flag"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -46,11 +46,6 @@ type MemMapData struct {
 	Path     string
 }
 
-var procName = flag.String("procName", "", "Process name to monitor")
-var peekMode = flag.Bool("peek", false, "Enable peek mode to view memory contents")
-var outFile = flag.String("out", "./out.rep", "The output file to be used for reporting time series data")
-var writeOut = flag.Bool("writeout", false, "Cause the time series data to be written to a file specified by the '--out' flag")
-
 func getPIDList() (pids []int) {
 	files, err := ioutil.ReadDir(procDir)
 	if err != nil {
@@ -90,7 +85,7 @@ func extractProcessName(in []byte) string {
 	return ""
 }
 
-func getProcessPid(pids []int) int {
+func getProcessPid(pids []int, name string) int {
 	for i := 0; i < len(pids); i++ {
 		fullPath := path.Join(procDir, strconv.Itoa(pids[i]))
 		b, err := ioutil.ReadFile(path.Join(fullPath, "status"))
@@ -98,11 +93,31 @@ func getProcessPid(pids []int) int {
 			log.Fatal(err)
 		}
 		n := extractProcessName(b)
-		if n == *procName {
+		if n == name {
 			return pids[i]
 		}
 	}
 	return -1
+}
+
+func genProcPath(name string) (ppath string, err error) {
+	p := getPIDList()
+	pp := getProcessPid(p, name)
+	if pp < 0 {
+		return "", errors.New("Unabled to find pid for process name")
+	}
+	ppath = path.Join(procDir, strconv.Itoa(pp))
+	return
+}
+
+func checkPermission() {
+	out, err := exec.Command("whoami").Output()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if rootUser != strings.TrimSpace(string(out)) {
+		log.Fatal("Unable to operate without root")
+	}
 }
 
 func addrToInt(addr string) (v int64) {
@@ -195,9 +210,19 @@ func procMap(ppath string) {
 	fmt.Println("Total size", overall)
 }
 
-func takeSample(ppath string, writeFile *os.File) {
+// PeekMemory Returns a momentary view of the processes memory at the time of the request.
+func PeekMemory(pname string) {
+}
+
+// SampleMemory returns a timestamped collection of memory usage samples.
+func SampleMemory(pname string) (sample MemSample) {
+	checkPermission()
+	ppath, err := genProcPath(pname)
+	if err != nil {
+		log.Fatal(err)
+	}
 	mapLines := parseMaps(ppath)
-	sample := MemSample{
+	sample = MemSample{
 		SampleTime: time.Now(),
 		Samples:    make(map[string]int64),
 	}
@@ -212,36 +237,11 @@ func takeSample(ppath string, writeFile *os.File) {
 		t += v
 	}
 	sample.Samples["Total"] = t
-	fmt.Println(sample)
+	return
 }
 
 func main() {
 	// Check to make sure we're running as root or sudo
-	out, err := exec.Command("whoami").Output()
-	if err != nil {
-		log.Fatal(err)
-	}
-	if rootUser != strings.TrimSpace(string(out)) {
-		log.Fatal("Unable to operate without root")
-	}
-
-	flag.Parse()
-
-	// Sort out operational parameters
-	if *procName == "" {
-		log.Fatal("Process name is required")
-	}
-
-	var oFile *os.File
-
-	if *writeOut {
-		oFile, err = os.Open(*outFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		oFile = nil
-	}
 
 	p := getPIDList()
 	pp := getProcessPid(p)
