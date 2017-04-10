@@ -2,7 +2,6 @@ package monocanthus
 
 import (
 	"errors"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -163,10 +162,15 @@ func getMapData(line string) (out MemMapData) {
 	return
 }
 
-func procMap(ppath string) {
+// PeekMemory Returns a momentary view of the processes memory at the time of the request.
+func PeekMemory(pname string) (results map[string]MemChunk, overall int64) {
+	checkPermission()
+	ppath, err := genProcPath(pname)
+	if err != nil {
+		log.Fatal(err)
+	}
 	asStr := parseMaps(ppath)
-	results := make(map[string]MemChunk)
-	// Go over each region
+	results = make(map[string]MemChunk)
 	for _, v := range asStr {
 		mapData := getMapData(v)
 		if mapData.Readable {
@@ -179,16 +183,12 @@ func procMap(ppath string) {
 				chunk.Data = make([]ChunkData, 0, 0)
 				chunk.TotalSize = 0
 			}
-			// Prepare new ChunkData
 			dat := ChunkData{}
-
-			// Open the memory file
 			m, err := os.Open(path.Join(ppath, "mem"))
 			if err != nil {
 				log.Fatal(err)
 			}
 			defer m.Close()
-			// Get the start and end of the region
 			chunkSize := mapData.End - mapData.Start
 			dat.Size = chunkSize
 			b := make([]byte, chunkSize, chunkSize)
@@ -202,16 +202,12 @@ func procMap(ppath string) {
 			results[mapData.Path] = chunk
 		}
 	}
-	overall := int64(0)
-	for k, v := range results {
-		fmt.Println(k, v.TotalSize)
+
+	overall = int64(0)
+	for _, v := range results {
 		overall += v.TotalSize
 	}
-	fmt.Println("Total size", overall)
-}
-
-// PeekMemory Returns a momentary view of the processes memory at the time of the request.
-func PeekMemory(pname string) {
+	return
 }
 
 // SampleMemory returns a timestamped collection of memory usage samples.
@@ -238,21 +234,4 @@ func SampleMemory(pname string) (sample MemSample) {
 	}
 	sample.Samples["Total"] = t
 	return
-}
-
-func main() {
-	// Check to make sure we're running as root or sudo
-
-	p := getPIDList()
-	pp := getProcessPid(p)
-	if pp < 0 {
-		log.Fatal("Unable to find pid for procName: " + *procName)
-	}
-	procPath := path.Join(procDir, strconv.Itoa(pp))
-
-	if *peekMode {
-		procMap(procPath)
-	}
-
-	takeSample(procPath, oFile)
 }
